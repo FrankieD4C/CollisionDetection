@@ -2,18 +2,16 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <limits.h>
 #include <math.h>
-#include <float.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 
 #include <cuda.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
-#include <thrust/device_vector.h>
+#include <thrust/reduce.h>
+#include <thrust/device_ptr.h>
 #include "collide.h"
 
 #define TINYOBJ_LOADER_C_IMPLEMENTATION
@@ -73,7 +71,7 @@ static const char* get_file_data(size_t* len, const char* filename) {
     const char* data = NULL;
 
     if (strcmp(ext, ".gz") == 0) {
-        assert(0); /* todo */
+        assert(0);
 
     } else {
         data = mmap_file(&data_len, filename);
@@ -115,7 +113,7 @@ static int LoadObjAndConvert(float bmin[3], float bmax[3], Mesh *mesh,
 
         /* Assume triangulated face. */
         size_t num_triangles = attrib.num_face_num_verts;
-        size_t stride = 3; // 3 = pos(3float)
+        size_t stride = 3;
 
         mesh->num_faces = num_triangles;
         mesh->vtx = (float*)malloc(sizeof(float) * stride * num_triangles * 3);
@@ -174,134 +172,6 @@ __device__ float MAX(float a, float b) {
 
 __device__ float MIN(float a, float b) {
     return (a<b)?(a):(b);
-}
-
-__device__ float dotproduct(Vector A, Vector B) {
-    return A.x * B.x + A.y * B.y + A.z * B.z;
-}
-
-__device__ bool isIntersection(Vector A, Vector B, Vector C, float radius) {
-
-    // Testing if sphere lies outside the triangle plane
-    Vector V; // Normal
-    V.x = ((B.y - A.y) * (C.z - A.z) - (B.z - A.z) * (C.y - A.y));
-    V.y = ((B.z - A.z) * (C.x - A.x) - (B.x - A.x) * (C.z - A.z));
-    V.z = ((B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x));
-    float radiusSqr = radius*radius;
-    float d = dotproduct(A, V);
-    float e = dotproduct(V, V);
-    if (d * d > e * radiusSqr) return 0;
-
-    // Testing if sphere lies outside a triangle vertex
-    float aa = dotproduct(A, A);
-    float ab = dotproduct(A, B);
-    float ac = dotproduct(A, C);
-    float bb = dotproduct(B, B);
-    float bc = dotproduct(B, C);
-    float cc = dotproduct(C, C);
-    if (aa > radiusSqr && ab > aa && ac > aa) return 0;
-    if (bb > radiusSqr && ab > bb && bc > bb) return 0;
-    if (cc > radiusSqr && ac > cc && bc > cc) return 0;
-
-    // Testing if sphere lies outside a triangle edge`
-    Vector AB, BC, CA, Q1, Q2, Q3, QC, QA, QB;
-    AB.x = B.x - A.x; AB.y = B.y - A.y; AB.z = B.z - A.z;
-    BC.x = C.x - B.x; BC.y = C.y - B.y; BC.z = C.z - B.z;
-    CA.x = A.x - C.x; CA.y = A.y - C.y; CA.z = A.z - C.z;
-
-    float d1 = dotproduct(A, AB);
-    float e1 = dotproduct(AB, AB);
-    float t1 = -d1/e1;
-    if (t1 < 0.0f) t1 = 0.0f;
-    if (t1 > 1.0f) t1 = 1.0f;
-    Q1.x = A.x + t1 * AB.x; Q1.y = A.y + t1 * AB.y; Q1.z = A.z + t1 * AB.z;
-    QC.x = C.x - Q1.x; QC.y = C.y - Q1.y; QC.z = C.z - Q1.z;
-    if (dotproduct(Q1, Q1) > radiusSqr && dotproduct(Q1, QC) > 0) return 0;
-
-    float d2 = dotproduct(B, BC);
-    float e2 = dotproduct(BC, BC);
-    float t2 = -d2/e2;
-    if (t2 < 0.0f) t2 = 0.0f;
-    if (t2 > 1.0f) t2 = 1.0f;
-    Q2.x = B.x + t2 * BC.x; Q2.y = B.y + t2 * BC.y; Q2.z = B.z + t2 * BC.z;
-    QA.x = A.x - Q2.x; QA.y = A.y - Q2.y; QA.z = A.z - Q2.z;
-    if (dotproduct(Q2, Q2) > radiusSqr && dotproduct(Q2, QA) > 0) return 0;
-
-    float d3 = dotproduct(C, CA);
-    float e3 = dotproduct(CA, CA);
-    float t3 = -d3/e3;
-    if (t3 < 0.0f) t3 = 0.0f;
-    if (t3 > 1.0f) t3 = 1.0f;
-    Q3.x = C.x + t3 * CA.x; Q3.y = C.y + t3 * CA.y; Q3.z = C.z +t3 * CA.z;
-    QB.x = B.x - Q3.x; QB.y = B.y - Q3.y; QB.z = B.z - Q3.z;
-    if (dotproduct(Q3, Q3) > radiusSqr && dotproduct(Q3, QB) > 0) return 0;
-
-    return 1;
-}
-
-__global__ void cuda_collide1(float *face, Vector *sphere, int* face_key, int* face_value,
-                            int *sphere_key, int *sphere_value, int *C_face, int *C_sphere,
-                            float radius, int bin_num, int facemapsize, int spheremapsize,
-                            int *resultnum) {
-    int id = blockIdx.x*blockDim.x + threadIdx.x;
-    if (id < bin_num) {
-        if (C_face[id] < 0 || C_sphere[id] < 0) return;
-        for (int i = C_face[id]; i < facemapsize && id == face_key[i]; i++) {
-            for (int j = C_sphere[id]; j < spheremapsize && id == sphere_key[j]; j++) {
-                Vector A, B, C, S;
-                S.x = sphere[sphere_value[j]].x;
-                S.y = sphere[sphere_value[j]].y;
-                S.z = sphere[sphere_value[j]].z;
-
-                A.x = face[face_value[i] * 3 * STRIDE + 0] - S.x;
-                A.y = face[face_value[i] * 3 * STRIDE + 1] - S.y;
-                A.z = face[face_value[i] * 3 * STRIDE + 2] - S.z;
-                B.x = face[face_value[i] * 3 * STRIDE + 3] - S.x;
-                B.y = face[face_value[i] * 3 * STRIDE + 4] - S.y;
-                B.z = face[face_value[i] * 3 * STRIDE + 5] - S.z;
-                C.x = face[face_value[i] * 3 * STRIDE + 6] - S.x;
-                C.y = face[face_value[i] * 3 * STRIDE + 7] - S.y;
-                C.z = face[face_value[i] * 3 * STRIDE + 8] - S.z;
-
-                if (isIntersection(A, B, C, radius))
-                    resultnum[id]++;
-            }
-        }
-    }
-}
-
-__global__ void cuda_collide2(float *face, Vector *sphere, int* face_key, int* face_value,
-                             int *sphere_key, int *sphere_value, int *C_face, int *C_sphere,
-                             float radius, int bin_num, int facemapsize, int spheremapsize,
-                             CollidePair* result, int *resultnum, int *collide_num) {
-    int id = blockIdx.x*blockDim.x + threadIdx.x;
-    if (id < bin_num) {
-        if (C_face[id] < 0 || C_sphere[id] < 0 || resultnum[id] == 0) return;
-        for (int i = C_face[id]; i < facemapsize && id == face_key[i]; i++) {
-            for (int j = C_sphere[id]; j < spheremapsize && id == sphere_key[j]; j++) {
-                Vector A, B, C, S;
-                S.x = sphere[sphere_value[j]].x;
-                S.y = sphere[sphere_value[j]].y;
-                S.z = sphere[sphere_value[j]].z;
-
-                A.x = face[face_value[i] * 3 * STRIDE + 0] - S.x;
-                A.y = face[face_value[i] * 3 * STRIDE + 1] - S.y;
-                A.z = face[face_value[i] * 3 * STRIDE + 2] - S.z;
-                B.x = face[face_value[i] * 3 * STRIDE + 3] - S.x;
-                B.y = face[face_value[i] * 3 * STRIDE + 4] - S.y;
-                B.z = face[face_value[i] * 3 * STRIDE + 5] - S.z;
-                C.x = face[face_value[i] * 3 * STRIDE + 6] - S.x;
-                C.y = face[face_value[i] * 3 * STRIDE + 7] - S.y;
-                C.z = face[face_value[i] * 3 * STRIDE + 8] - S.z;
-
-                if (isIntersection(A, B, C, radius)) {
-                    int idx = atomicAdd(collide_num, 1);
-                    result[idx].sphere = sphere_value[j];
-                    result[idx].face = face_value[i];
-                }
-            }
-        }
-    }
 }
 
 __global__ void cuda_stage1mesh(float *face, int *subdiv_face, int *face_min_bin, int *face_max_bin,
@@ -378,12 +248,165 @@ __global__ void cuda_stage3sphere(int *subdiv_sphere, int *sphere_min_bin, int *
             }
 }
 
+__global__ void cuda_stage5mesh(int *face_key, int *C_face, int bin_num, int facemapsize) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id < facemapsize && id > 0) {
+        if (face_key[id] != face_key[id-1]){
+            C_face[face_key[id]] = id;
+        }
+    } else if (id == 0) {
+        C_face[face_key[id]] = id;
+    }
+}
+
+__global__ void cuda_stage5sphere(int *sphere_key, int *C_sphere, int bin_num, int spheremapsize) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id < spheremapsize && id > 0) {
+        if (sphere_key[id] != sphere_key[id-1]){
+            C_sphere[sphere_key[id]] = id;
+        }
+    } else if (id == 0) {
+        C_sphere[sphere_key[id]] = id;
+    }
+}
+
+
+__device__ float dotproduct(Vector A, Vector B) {
+    return A.x * B.x + A.y * B.y + A.z * B.z;
+}
+
+__device__ bool isIntersection(Vector A, Vector B, Vector C, float radius) {
+
+    // Testing if sphere lies outside the triangle plane
+    Vector V; // Normal
+    V.x = ((B.y - A.y) * (C.z - A.z) - (B.z - A.z) * (C.y - A.y));
+    V.y = ((B.z - A.z) * (C.x - A.x) - (B.x - A.x) * (C.z - A.z));
+    V.z = ((B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x));
+    float radiusSqr = radius*radius;
+    float d = dotproduct(A, V);
+    float e = dotproduct(V, V);
+    if (d * d > e * radiusSqr) return 0;
+
+    // Testing if sphere lies outside a triangle vertex
+    float aa = dotproduct(A, A);
+    float ab = dotproduct(A, B);
+    float ac = dotproduct(A, C);
+    float bb = dotproduct(B, B);
+    float bc = dotproduct(B, C);
+    float cc = dotproduct(C, C);
+    if (aa > radiusSqr && ab > aa && ac > aa) return 0;
+    if (bb > radiusSqr && ab > bb && bc > bb) return 0;
+    if (cc > radiusSqr && ac > cc && bc > cc) return 0;
+
+    // Testing if sphere lies outside a triangle edge`
+    Vector AB, BC, CA, Q1, Q2, Q3, QC, QA, QB;
+    AB.x = B.x - A.x; AB.y = B.y - A.y; AB.z = B.z - A.z;
+    BC.x = C.x - B.x; BC.y = C.y - B.y; BC.z = C.z - B.z;
+    CA.x = A.x - C.x; CA.y = A.y - C.y; CA.z = A.z - C.z;
+
+    float d1 = dotproduct(A, AB);
+    float e1 = dotproduct(AB, AB);
+    float t1 = -d1/e1;
+    if (t1 < 0.0f) t1 = 0.0f;
+    if (t1 > 1.0f) t1 = 1.0f;
+    Q1.x = A.x + t1 * AB.x; Q1.y = A.y + t1 * AB.y; Q1.z = A.z + t1 * AB.z;
+    QC.x = C.x - Q1.x; QC.y = C.y - Q1.y; QC.z = C.z - Q1.z;
+    if (dotproduct(Q1, Q1) > radiusSqr && dotproduct(Q1, QC) > 0) return 0;
+
+    float d2 = dotproduct(B, BC);
+    float e2 = dotproduct(BC, BC);
+    float t2 = -d2/e2;
+    if (t2 < 0.0f) t2 = 0.0f;
+    if (t2 > 1.0f) t2 = 1.0f;
+    Q2.x = B.x + t2 * BC.x; Q2.y = B.y + t2 * BC.y; Q2.z = B.z + t2 * BC.z;
+    QA.x = A.x - Q2.x; QA.y = A.y - Q2.y; QA.z = A.z - Q2.z;
+    if (dotproduct(Q2, Q2) > radiusSqr && dotproduct(Q2, QA) > 0) return 0;
+
+    float d3 = dotproduct(C, CA);
+    float e3 = dotproduct(CA, CA);
+    float t3 = -d3/e3;
+    if (t3 < 0.0f) t3 = 0.0f;
+    if (t3 > 1.0f) t3 = 1.0f;
+    Q3.x = C.x + t3 * CA.x; Q3.y = C.y + t3 * CA.y; Q3.z = C.z +t3 * CA.z;
+    QB.x = B.x - Q3.x; QB.y = B.y - Q3.y; QB.z = B.z - Q3.z;
+    if (dotproduct(Q3, Q3) > radiusSqr && dotproduct(Q3, QB) > 0) return 0;
+
+    return 1;
+}
+
+__global__ void cuda_collide1(float *face, Vector *sphere, int* face_key, int* face_value,
+                              int *sphere_key, int *sphere_value, int *C_face, int *C_sphere,
+                              float radius, int bin_num, int facemapsize, int spheremapsize,
+                              int *resultnum) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id < bin_num) {
+        if (C_face[id] < 0 || C_sphere[id] < 0) return;
+        for (int i = C_face[id]; i < facemapsize && id == face_key[i]; i++) {
+            for (int j = C_sphere[id]; j < spheremapsize && id == sphere_key[j]; j++) {
+                Vector A, B, C, S;
+                S.x = sphere[sphere_value[j]].x;
+                S.y = sphere[sphere_value[j]].y;
+                S.z = sphere[sphere_value[j]].z;
+
+                A.x = face[face_value[i] * 3 * STRIDE + 0] - S.x;
+                A.y = face[face_value[i] * 3 * STRIDE + 1] - S.y;
+                A.z = face[face_value[i] * 3 * STRIDE + 2] - S.z;
+                B.x = face[face_value[i] * 3 * STRIDE + 3] - S.x;
+                B.y = face[face_value[i] * 3 * STRIDE + 4] - S.y;
+                B.z = face[face_value[i] * 3 * STRIDE + 5] - S.z;
+                C.x = face[face_value[i] * 3 * STRIDE + 6] - S.x;
+                C.y = face[face_value[i] * 3 * STRIDE + 7] - S.y;
+                C.z = face[face_value[i] * 3 * STRIDE + 8] - S.z;
+
+                if (isIntersection(A, B, C, radius))
+                    resultnum[id]++;
+            }
+        }
+    }
+}
+
+__global__ void cuda_collide2(float *face, Vector *sphere, int* face_key, int* face_value,
+                              int *sphere_key, int *sphere_value, int *C_face, int *C_sphere,
+                              float radius, int bin_num, int facemapsize, int spheremapsize,
+                              CollidePair* result, int *resultnum, int *collide_num) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id < bin_num) {
+        if (C_face[id] < 0 || C_sphere[id] < 0 || resultnum[id] == 0) return;
+        for (int i = C_face[id]; i < facemapsize && id == face_key[i]; i++) {
+            for (int j = C_sphere[id]; j < spheremapsize && id == sphere_key[j]; j++) {
+                Vector A, B, C, S;
+                S.x = sphere[sphere_value[j]].x;
+                S.y = sphere[sphere_value[j]].y;
+                S.z = sphere[sphere_value[j]].z;
+
+                A.x = face[face_value[i] * 3 * STRIDE + 0] - S.x;
+                A.y = face[face_value[i] * 3 * STRIDE + 1] - S.y;
+                A.z = face[face_value[i] * 3 * STRIDE + 2] - S.z;
+                B.x = face[face_value[i] * 3 * STRIDE + 3] - S.x;
+                B.y = face[face_value[i] * 3 * STRIDE + 4] - S.y;
+                B.z = face[face_value[i] * 3 * STRIDE + 5] - S.z;
+                C.x = face[face_value[i] * 3 * STRIDE + 6] - S.x;
+                C.y = face[face_value[i] * 3 * STRIDE + 7] - S.y;
+                C.z = face[face_value[i] * 3 * STRIDE + 8] - S.z;
+
+                if (isIntersection(A, B, C, radius)) {
+                    int idx = atomicAdd(collide_num, 1);
+                    result[idx].sphere = sphere_value[j];
+                    result[idx].face = face_value[i];
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
 
-    cudaEvent_t startEvent, stop1, stop2, stop3, stopEvent;
+    // Set timers
+    cudaEvent_t startEvent, stop1, stop2, stopEvent;
     cudaEventCreate(&startEvent);
     cudaEventRecord(startEvent, 0);
     printf("Start...\n");
+
     if (argc < 5) {
         fprintf(stderr, "Usage: ./collide meshfile spherefile radius outfile\n");
         exit(-1);
@@ -400,7 +423,6 @@ int main(int argc, char* argv[]) {
     printf("Successfully load meshfile, facenum: %d\n", mesh.num_faces);
 
     // Load & conv spherefile
-
     FILE *fp = fopen(argv[2],"r");
     if (fp == NULL) {
         printf("failed to load & conv spherefile\n");
@@ -410,6 +432,7 @@ int main(int argc, char* argv[]) {
     fgets(buffer, 20, fp);
     if (strcmp(buffer, "x,y,z\n") != 0) {
         printf("failed to load & conv spherefile\n");
+        free(buffer);
         exit(-1);
     }
     free(buffer);
@@ -429,7 +452,6 @@ int main(int argc, char* argv[]) {
         smax[0] = (sphere[num_sphere].x > smax[0]) ? sphere[num_sphere].x : smax[0];
         smax[1] = (sphere[num_sphere].y > smax[1]) ? sphere[num_sphere].y : smax[1];
         smax[2] = (sphere[num_sphere].z > smax[2]) ? sphere[num_sphere].z : smax[2];
-
         num_sphere++;
         if (num_sphere >= size) {
             size *= 2;
@@ -439,7 +461,6 @@ int main(int argc, char* argv[]) {
     fclose(fp);
     printf("Successfully load spherefile, spherenum: %d\n", num_sphere);
 
-    // Set timers
     cudaEventCreate(&stop1);
     cudaEventRecord(stop1, 0);
     cudaEventSynchronize(stop1);
@@ -466,6 +487,7 @@ int main(int argc, char* argv[]) {
     printf("xbin = %d, ybin = %d, zbin = %d\n", binnum[0], binnum[1], binnum[2]);
     printf("===================================================\n");
 
+    // Start GPU computing
     float *d_min, *d_max;
     float *d_face;
     Vector *d_sphere;
@@ -515,7 +537,6 @@ int main(int argc, char* argv[]) {
     cuda_stage3mesh<<<(mesh.num_faces+1023)/1024, 1024>>>(subdiv_face, face_min_bin, face_max_bin,
                                                             d_face_value, d_face_key, binnum[0], binnum[1],
                                                                 mesh.num_faces);
-
     cuda_stage3sphere<<<(num_sphere+1023)/1024, 1024>>>(subdiv_sphere, sphere_min_bin, sphere_max_bin,
                                                             d_sphere_value, d_sphere_key, binnum[0], binnum[1],
                                                                 num_sphere);
@@ -532,66 +553,31 @@ int main(int argc, char* argv[]) {
     thrust::sort_by_key(t_face_key, t_face_key + FaceMapSize, t_face_value);
     thrust::sort_by_key(t_sphere_key, t_sphere_key + SphereMapSize, t_sphere_value);
 
+    // Stage 5
+    int bin_num = binnum[0] * binnum[1] * binnum[2];
+    int *d_C_face, *d_C_sphere;
+    cudaMalloc(&d_C_sphere, sizeof(int) * bin_num);
+    cudaMalloc(&d_C_face, sizeof(int) * bin_num);
+    cudaMemset(d_C_sphere, -1, sizeof(int) * bin_num);
+    cudaMemset(d_C_face, -1, sizeof(int) * bin_num);
+
+    cuda_stage5mesh<<<(FaceMapSize+1023)/1024, 1024>>>(d_face_key, d_C_face, bin_num, FaceMapSize);
+    cuda_stage5sphere<<<(SphereMapSize+1023)/1024, 1024>>>(d_sphere_key, d_C_sphere, bin_num, SphereMapSize);
+    cudaDeviceSynchronize();
+
     cudaEventCreate(&stop2);
     cudaEventRecord(stop2, 0);
     cudaEventSynchronize(stop2);
     float time2;
     cudaEventElapsedTime(&time2, stop1, stop2);
 
-    int *face_value = (int*)malloc(FaceMapSize * sizeof(int));
-    int *face_key = (int*)malloc(FaceMapSize * sizeof(int));
-    int *sphere_value = (int*)malloc(SphereMapSize * sizeof(int));
-    int *sphere_key = (int*)malloc(SphereMapSize * sizeof(int));
-    cudaMemcpy(face_key, d_face_key, sizeof(int) * FaceMapSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(face_value, d_face_value, sizeof(int) * FaceMapSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(sphere_key, d_sphere_key, sizeof(int) * SphereMapSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(sphere_value, d_sphere_value, sizeof(int) * SphereMapSize, cudaMemcpyDeviceToHost);
+    // Skip stage 6
 
-    // Stage 5
-    int bin_num = binnum[0] * binnum[1] * binnum[2];
-    int *C_face = (int*)malloc(bin_num * sizeof(int));
-    int *C_sphere = (int*)malloc(bin_num * sizeof(int));
-    int face_ptr = 0;
-    int sphere_ptr = 0;
-    for (int i = 0; i < bin_num; i++) {
-        C_face[i] = face_ptr;
-        int isActive = 0;
-        while (face_ptr < FaceMapSize && face_key[face_ptr] == i) {
-            face_ptr++;
-            isActive = 1;
-        }
-        if (isActive == 0) C_face[i] = -1;
-        C_sphere[i] = sphere_ptr;
-        isActive = 0;
-        while (sphere_ptr < SphereMapSize && sphere_key[sphere_ptr] == i) {
-            sphere_ptr++;
-            isActive = 1;
-        }
-        if (isActive == 0) C_sphere[i] = -1;
-    }
-    free(face_value); free(face_key);
-    free(sphere_value); free(sphere_key);
-
-    cudaEventCreate(&stop3);
-    cudaEventRecord(stop3, 0);
-    cudaEventSynchronize(stop3);
-    float time3;
-    cudaEventElapsedTime(&time3, stop2, stop3);
-
-    // Temporarily skip stage 6
-
-    // Stage 7
-    int *d_C_face, *d_C_sphere;
+    // GPU collision detection Stage
     int *d_resultnum;
     int *d_collide_num;
-
-    cudaMalloc(&d_C_sphere, sizeof(int) * bin_num);
-    cudaMalloc(&d_C_face, sizeof(int) * bin_num);
     cudaMalloc(&d_collide_num, sizeof(int));
     cudaMalloc(&d_resultnum, sizeof(int) * bin_num);
-
-    cudaMemcpy(d_C_sphere, C_sphere, sizeof(int) * bin_num, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_C_face, C_face, sizeof(int) * bin_num, cudaMemcpyHostToDevice);
     cudaMemset(d_collide_num, 0, sizeof(int));
     cudaMemset(d_resultnum, 0, sizeof(int) * bin_num);
 
@@ -614,20 +600,18 @@ int main(int argc, char* argv[]) {
 
     thrust::device_ptr<CollidePair> t_result(d_result);
     thrust::sort(t_result, t_result + collide_num, ResultCmp());
-    d_face_key = thrust::raw_pointer_cast(&t_face_key[0]);
     CollidePair *result = (CollidePair*)malloc(sizeof(CollidePair) * collide_num);
     cudaMemcpy(result, d_result, sizeof(CollidePair) * collide_num, cudaMemcpyDeviceToHost);
 
     cudaEventCreate(&stopEvent);
     cudaEventRecord(stopEvent, 0);
     cudaEventSynchronize(stopEvent);
-    float time4, elapsedTime;
-    cudaEventElapsedTime(&time4, stop3, stopEvent);
+    float time3, elapsedTime;
+    cudaEventElapsedTime(&time3, stop2, stopEvent);
     cudaEventElapsedTime(&elapsedTime, stop1, stopEvent);
 
-    printf("Stage 1-4 time: %f ms\n", time2);
-    printf("Stage 5 time: %f ms\n", time3);
-    printf("GPU collision detection time: %f ms\n", time4);
+    printf("Stage 1-5 time: %f ms\n", time2);
+    printf("GPU collision detection time: %f ms\n", time3);
     printf("total time (w/out loading time): %f ms\n", elapsedTime);
 
     // Output & Free memory
@@ -653,7 +637,6 @@ int main(int argc, char* argv[]) {
     cudaFree(d_collide_num); cudaFree(d_resultnum); cudaFree(d_result);
 
     free(mesh.vtx); free(sphere);
-    free(C_face); free(C_sphere);
     free(result);
     return 0;
 }
