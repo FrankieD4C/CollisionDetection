@@ -168,11 +168,11 @@ static int LoadObjAndConvert(float bmin[3], float bmax[3], Mesh *mesh,
     return 0;
 }
 
-float MAX(float a, float b) {
+__device__ float MAX(float a, float b) {
     return (a>b)?(a):(b);
 }
 
-float MIN(float a, float b) {
+__device__ float MIN(float a, float b) {
     return (a<b)?(a):(b);
 }
 
@@ -203,7 +203,7 @@ __device__ bool isIntersection(Vector A, Vector B, Vector C, float radius) {
     if (bb > radiusSqr && ab > bb && bc > bb) return 0;
     if (cc > radiusSqr && ac > cc && bc > cc) return 0;
 
-    // Testing if sphere lies outside a triangle edge
+    // Testing if sphere lies outside a triangle edge`
     Vector AB, BC, CA, Q1, Q2, Q3, QC, QA, QB;
     AB.x = B.x - A.x; AB.y = B.y - A.y; AB.z = B.z - A.z;
     BC.x = C.x - B.x; BC.y = C.y - B.y; BC.z = C.z - B.z;
@@ -241,13 +241,13 @@ __device__ bool isIntersection(Vector A, Vector B, Vector C, float radius) {
 
 __global__ void cuda_collide1(float *face, Vector *sphere, int* face_key, int* face_value,
                             int *sphere_key, int *sphere_value, int *C_face, int *C_sphere,
-                            float radius, int bin_num, int facesize, int spheresize,
+                            float radius, int bin_num, int facemapsize, int spheremapsize,
                             int *resultnum) {
     int id = blockIdx.x*blockDim.x + threadIdx.x;
     if (id < bin_num) {
         if (C_face[id] < 0 || C_sphere[id] < 0) return;
-        for (int i = C_face[id]; i < facesize && id == face_key[i]; i++) {
-            for (int j = C_sphere[id]; j < spheresize && id == sphere_key[j]; j++) {
+        for (int i = C_face[id]; i < facemapsize && id == face_key[i]; i++) {
+            for (int j = C_sphere[id]; j < spheremapsize && id == sphere_key[j]; j++) {
                 Vector A, B, C, S;
                 S.x = sphere[sphere_value[j]].x;
                 S.y = sphere[sphere_value[j]].y;
@@ -272,13 +272,13 @@ __global__ void cuda_collide1(float *face, Vector *sphere, int* face_key, int* f
 
 __global__ void cuda_collide2(float *face, Vector *sphere, int* face_key, int* face_value,
                              int *sphere_key, int *sphere_value, int *C_face, int *C_sphere,
-                             float radius, int bin_num, int facesize, int spheresize,
+                             float radius, int bin_num, int facemapsize, int spheremapsize,
                              CollidePair* result, int *resultnum, int *collide_num) {
     int id = blockIdx.x*blockDim.x + threadIdx.x;
     if (id < bin_num) {
         if (C_face[id] < 0 || C_sphere[id] < 0 || resultnum[id] == 0) return;
-        for (int i = C_face[id]; i < facesize && id == face_key[i]; i++) {
-            for (int j = C_sphere[id]; j < spheresize && id == sphere_key[j]; j++) {
+        for (int i = C_face[id]; i < facemapsize && id == face_key[i]; i++) {
+            for (int j = C_sphere[id]; j < spheremapsize && id == sphere_key[j]; j++) {
                 Vector A, B, C, S;
                 S.x = sphere[sphere_value[j]].x;
                 S.y = sphere[sphere_value[j]].y;
@@ -304,12 +304,86 @@ __global__ void cuda_collide2(float *face, Vector *sphere, int* face_key, int* f
     }
 }
 
+__global__ void cuda_stage1mesh(float *face, int *subdiv_face, int *face_min_bin, int *face_max_bin,
+                                float *bmin, float binsize, int facenum) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id >= facenum) return;
+    subdiv_face[id] = 1;
+    for (int k = 0; k < 3; k++) {
+        float f0 = face[(3 * id + 0) * STRIDE + k];
+        float f1 = face[(3 * id + 1) * STRIDE + k];
+        float f2 = face[(3 * id + 2) * STRIDE + k];
+        float smax = MAX(MAX(f0, f1), f2);
+        float smin = MIN(MIN(f0, f1), f2);
+
+        face_min_bin[id * 3 + k] = floorf(smin / binsize) - floorf(bmin[k] / binsize);
+        face_max_bin[id * 3 + k] = ceilf(smax / binsize) - floorf(bmin[k] / binsize);
+        int num = face_max_bin[id * 3 + k] - face_min_bin[id * 3 + k];
+        subdiv_face[id] *= num;
+    }
+}
+
+__global__ void cuda_stage1sphere(Vector *sphere, int *subdiv_sphere, int *sphere_min_bin, int *sphere_max_bin,
+                                float *bmin, float binsize, float radius, int spherenum) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id >= spherenum) return;
+    sphere_max_bin[id * 3 + 0] = ceilf((sphere[id].x + radius) / binsize)
+                                    - floorf(bmin[0] / binsize);
+    sphere_min_bin[id * 3 + 0] = floorf((sphere[id].x - radius) / binsize)
+                                    - floorf(bmin[0] / binsize);
+    sphere_max_bin[id * 3 + 1] = ceilf((sphere[id].y + radius) / binsize)
+                                    - floorf(bmin[1] / binsize);
+    sphere_min_bin[id * 3 + 1] = floorf((sphere[id].y - radius) / binsize)
+                                    - floorf(bmin[1] / binsize);
+    sphere_max_bin[id * 3 + 2] = ceilf((sphere[id].z + radius) / binsize)
+                                    - floorf(bmin[2] / binsize);
+    sphere_min_bin[id * 3 + 2] = floorf((sphere[id].z - radius) / binsize)
+                                    - floorf(bmin[2] / binsize);
+
+    int xnum = sphere_max_bin[id * 3 + 0] - sphere_min_bin[id * 3 + 0];
+    int ynum = sphere_max_bin[id * 3 + 1] - sphere_min_bin[id * 3 + 1];
+    int znum = sphere_max_bin[id * 3 + 2] - sphere_min_bin[id * 3 + 2];
+    subdiv_sphere[id] = xnum * ynum * znum;
+}
+
+__global__ void cuda_stage3mesh(int *subdiv_face, int *face_min_bin, int *face_max_bin,
+                                    int *face_value, int *face_key, int binnum0, int binnum1, int facenum) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id >= facenum) return;
+    int n;
+    if (id == 0) { n = 0; }
+        else { n = subdiv_face[id-1];}
+    for (int k = face_min_bin[id * 3 + 2]; k < face_max_bin[id * 3 + 2]; k++)
+        for (int j = face_min_bin[id * 3 + 1]; j < face_max_bin[id * 3 + 1]; j++)
+            for (int i = face_min_bin[id * 3 + 0]; i < face_max_bin[id * 3 + 0]; i++) {
+                face_value[n] = id;
+                face_key[n] = i + j * binnum0 + k * binnum0 * binnum1;
+                n++;
+            }
+}
+
+__global__ void cuda_stage3sphere(int *subdiv_sphere, int *sphere_min_bin, int *sphere_max_bin,
+                                    int *sphere_value, int *sphere_key, int binnum0, int binnum1, int spherenum) {
+    int id = blockIdx.x*blockDim.x + threadIdx.x;
+    if (id >= spherenum) return;
+    int n;
+    if (id == 0) { n = 0; }
+    else { n = subdiv_sphere[id-1]; }
+    for (int k = sphere_min_bin[id * 3 + 2]; k < sphere_max_bin[id * 3 + 2]; k++)
+        for (int j = sphere_min_bin[id * 3 + 1]; j < sphere_max_bin[id * 3 + 1]; j++)
+            for (int i = sphere_min_bin[id * 3 + 0]; i < sphere_max_bin[id * 3 + 0]; i++) {
+                sphere_value[n] = id;
+                sphere_key[n] = i + j * binnum0 + k * binnum0 * binnum1;
+                n++;
+            }
+}
+
 int main(int argc, char* argv[]) {
 
     cudaEvent_t startEvent, stop1, stop2, stop3, stopEvent;
     cudaEventCreate(&startEvent);
     cudaEventRecord(startEvent, 0);
-
+    printf("Start...\n");
     if (argc < 5) {
         fprintf(stderr, "Usage: ./collide meshfile spherefile radius outfile\n");
         exit(-1);
@@ -326,6 +400,7 @@ int main(int argc, char* argv[]) {
     printf("Successfully load meshfile, facenum: %d\n", mesh.num_faces);
 
     // Load & conv spherefile
+
     FILE *fp = fopen(argv[2],"r");
     if (fp == NULL) {
         printf("failed to load & conv spherefile\n");
@@ -374,11 +449,11 @@ int main(int argc, char* argv[]) {
     printf("===================================================\n");
 
     // Exec
-    // Stage 1 (CAN BE PARALLELIZED)
+    // Stage 1
     // we set binsize = 2*radius
     float radius = atof(argv[3]);
-    printf("radius = %f\n", radius);
     float binsize = 2*radius;
+    printf("radius = %f, binsize = %f\n", radius, binsize);
     int binnum[3];
     for (int i = 0; i < 3; i++) {
         bmin[i] = (bmin[i] < smin[i] - radius) ? bmin[i] : smin[i] - radius;
@@ -391,88 +466,71 @@ int main(int argc, char* argv[]) {
     printf("xbin = %d, ybin = %d, zbin = %d\n", binnum[0], binnum[1], binnum[2]);
     printf("===================================================\n");
 
-    int* subdiv_face = (int*)malloc(mesh.num_faces * sizeof(int));
-    int* face_min_bin = (int*)malloc(3 * mesh.num_faces * sizeof(int));
-    int* face_max_bin = (int*)malloc(3 * mesh.num_faces * sizeof(int));
-    for (int i = 0; i < mesh.num_faces; i++) {
-        subdiv_face[i] = 1;
-        for (int k = 0; k < 3; k++) {
-            float f0 = mesh.vtx[(3 * i + 0) * STRIDE + k];
-            float f1 = mesh.vtx[(3 * i + 1) * STRIDE + k];
-            float f2 = mesh.vtx[(3 * i + 2) * STRIDE + k];
-            float smax = MAX(MAX(f0, f1), f2);
-            float smin = MIN(MIN(f0, f1), f2);
+    float *d_min, *d_max;
+    float *d_face;
+    Vector *d_sphere;
+    cudaMalloc(&d_min, sizeof(float) * 3);
+    cudaMalloc(&d_max, sizeof(float) * 3);
+    cudaMalloc(&d_face, sizeof(float) * mesh.num_faces * STRIDE * 3);
+    cudaMalloc(&d_sphere, sizeof(Vector) * num_sphere);
+    cudaMemcpy(d_min, bmin, sizeof(float) * 3, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_max, bmax, sizeof(float) * 3, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_face, mesh.vtx, sizeof(float) * mesh.num_faces * STRIDE * 3, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sphere, sphere, sizeof(Vector) * num_sphere, cudaMemcpyHostToDevice);
 
-            face_min_bin[i * 3 + k] = floorf(smin / binsize) - floorf(bmin[k] / binsize);
-            face_max_bin[i * 3 + k] = ceilf(smax / binsize) - floorf(bmin[k] / binsize);
-            int num = face_max_bin[i * 3 + k] - face_min_bin[i * 3 + k];
-            subdiv_face[i] *= num;
-        }
-        //printf("%d %d %d\n", face_max_bin[i * 3 + 0], face_max_bin[i * 3 + 1], face_max_bin[i * 3 + 2]);
-        //printf("%d %d %d\n", face_min_bin[i * 3 + 0], face_min_bin[i * 3 + 1], face_min_bin[i * 3 + 2]);
-        //printf("%d\n", subdiv_face[i]);
-    }
+    int *subdiv_face, *face_min_bin, *face_max_bin;
+    cudaMalloc(&subdiv_face, sizeof(int) * mesh.num_faces);
+    cudaMalloc(&face_min_bin, sizeof(int) * mesh.num_faces * 3);
+    cudaMalloc(&face_max_bin, sizeof(int) * mesh.num_faces * 3);
 
-    int* subdiv_sphere = (int*)malloc(num_sphere * sizeof(int));
-    int* sphere_min_bin = (int*)malloc(3 * num_sphere * sizeof(int));
-    int* sphere_max_bin = (int*)malloc(3 * num_sphere * sizeof(int));
-    for (int i = 0; i < num_sphere; i++) {
-        sphere_max_bin[i * 3 + 0] = ceilf((sphere[i].x + radius) / binsize)
-                                        - floorf(bmin[0] / binsize);
-        sphere_min_bin[i * 3 + 0] = floorf((sphere[i].x - radius) / binsize)
-                                        - floorf(bmin[0] / binsize);
-        sphere_max_bin[i * 3 + 1] = ceilf((sphere[i].y + radius) / binsize)
-                                        - floorf(bmin[1] / binsize);
-        sphere_min_bin[i * 3 + 1] = floorf((sphere[i].y - radius) / binsize)
-                                        - floorf(bmin[1] / binsize);
-        sphere_max_bin[i * 3 + 2] = ceilf((sphere[i].z + radius) / binsize)
-                                        - floorf(bmin[2] / binsize);
-        sphere_min_bin[i * 3 + 2] = floorf((sphere[i].z - radius) / binsize)
-                                        - floorf(bmin[2] / binsize);
+    int *subdiv_sphere, *sphere_min_bin, *sphere_max_bin;
+    cudaMalloc(&subdiv_sphere, sizeof(int) * num_sphere);
+    cudaMalloc(&sphere_min_bin, sizeof(int) * num_sphere * 3);
+    cudaMalloc(&sphere_max_bin, sizeof(int) * num_sphere * 3);
 
-        int xnum = sphere_max_bin[i * 3 + 0] - sphere_min_bin[i * 3 + 0];
-        int ynum = sphere_max_bin[i * 3 + 1] - sphere_min_bin[i * 3 + 1];
-        int znum = sphere_max_bin[i * 3 + 2] - sphere_min_bin[i * 3 + 2];
-        subdiv_sphere[i] = xnum * ynum * znum;
-        //printf("%d %d %d %d\n", xnum, ynum, znum, subdiv_sphere[i]);
-        //printf("%d ", subdiv_sphere[i]);
-    }
+    cuda_stage1mesh<<<(mesh.num_faces+1023)/1024, 1024>>>(d_face, subdiv_face, face_min_bin, face_max_bin,
+                                                            d_min, binsize, mesh.num_faces);
+    cuda_stage1sphere<<<(num_sphere+1023)/1024, 1024>>>(d_sphere, subdiv_sphere, sphere_min_bin, sphere_max_bin,
+                                                            d_min, binsize, radius, num_sphere);
+    cudaDeviceSynchronize();
+    cudaFree(d_min); cudaFree(d_max);
 
     // Stage 2
-    thrust::inclusive_scan(subdiv_face, subdiv_face + mesh.num_faces, subdiv_face);
-    thrust::inclusive_scan(subdiv_sphere, subdiv_sphere + num_sphere, subdiv_sphere);
-    //printf("%d, %d\n", subdiv_face[mesh.num_faces-1], subdiv_sphere[num_sphere-1]);
+    thrust::device_ptr<int> t_subdiv_face(subdiv_face);
+    thrust::device_ptr<int> t_subdiv_sphere(subdiv_sphere);
+    thrust::inclusive_scan(t_subdiv_face, t_subdiv_face + mesh.num_faces, t_subdiv_face);
+    thrust::inclusive_scan(t_subdiv_sphere, t_subdiv_sphere + num_sphere, t_subdiv_sphere);
+    int FaceMapSize, SphereMapSize;
+    cudaMemcpy(&FaceMapSize, subdiv_face + mesh.num_faces - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&SphereMapSize, subdiv_sphere + num_sphere - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    //printf("%d, %d\n", FaceMapSize, SphereMapSize);
 
     // Stage 3
-    int BFaceSize = subdiv_face[mesh.num_faces-1];
-    int BSphereSize = subdiv_sphere[num_sphere-1];
-    int *face_value = (int*)malloc(BFaceSize * sizeof(int));
-    int *face_key = (int*)malloc(BFaceSize * sizeof(int));
-    int *sphere_value = (int*)malloc(BSphereSize * sizeof(int));
-    int *sphere_key = (int*)malloc(BSphereSize * sizeof(int));
-    int count = 0;
-    for (int n = 0; n < mesh.num_faces; n++) {
-        for (int k = face_min_bin[n * 3 + 2]; k < face_max_bin[n * 3 + 2]; k++)
-            for (int j = face_min_bin[n * 3 + 1]; j < face_max_bin[n * 3 + 1]; j++)
-                for (int i = face_min_bin[n * 3 + 0]; i < face_max_bin[n * 3 + 0]; i++) {
-                    face_value[count] = n;
-                    face_key[count] = i + j * binnum[0] + k * binnum[0] * binnum[1];
-                    count ++;
-                }
-    }
-    count = 0;
-    for (int n = 0; n < num_sphere; n++) {
-        for (int k = sphere_min_bin[n * 3 + 2]; k < sphere_max_bin[n * 3 + 2]; k++)
-            for (int j = sphere_min_bin[n * 3 + 1]; j < sphere_max_bin[n * 3 + 1]; j++)
-                for (int i = sphere_min_bin[n * 3 + 0]; i < sphere_max_bin[n * 3 + 0]; i++) {
-                    sphere_value[count] = n;
-                    sphere_key[count] = i + j * binnum[0] + k * binnum[0] * binnum[1];
-                    count ++;
-                }
-    }
+    int *d_face_key, *d_face_value, *d_sphere_key, *d_sphere_value;
+    cudaMalloc(&d_face_value, FaceMapSize * sizeof(int));
+    cudaMalloc(&d_face_key, FaceMapSize * sizeof(int));
+    cudaMalloc(&d_sphere_value, SphereMapSize * sizeof(int));
+    cudaMalloc(&d_sphere_key, SphereMapSize * sizeof(int));
 
-    free(subdiv_face); free(face_min_bin); free(face_max_bin);
-    free(subdiv_sphere); free(sphere_min_bin); free(sphere_max_bin);
+    cuda_stage3mesh<<<(mesh.num_faces+1023)/1024, 1024>>>(subdiv_face, face_min_bin, face_max_bin,
+                                                            d_face_value, d_face_key, binnum[0], binnum[1],
+                                                                mesh.num_faces);
+
+    cuda_stage3sphere<<<(num_sphere+1023)/1024, 1024>>>(subdiv_sphere, sphere_min_bin, sphere_max_bin,
+                                                            d_sphere_value, d_sphere_key, binnum[0], binnum[1],
+                                                                num_sphere);
+    cudaDeviceSynchronize();
+
+    cudaFree(subdiv_face); cudaFree(face_min_bin); cudaFree(face_max_bin);
+    cudaFree(subdiv_sphere); cudaFree(sphere_min_bin); cudaFree(sphere_max_bin);
+
+    // Stage 4
+    thrust::device_ptr<int> t_face_key(d_face_key);
+    thrust::device_ptr<int> t_face_value(d_face_value);
+    thrust::device_ptr<int> t_sphere_key(d_sphere_key);
+    thrust::device_ptr<int> t_sphere_value(d_sphere_value);
+    thrust::sort_by_key(t_face_key, t_face_key + FaceMapSize, t_face_value);
+    thrust::sort_by_key(t_sphere_key, t_sphere_key + SphereMapSize, t_sphere_value);
 
     cudaEventCreate(&stop2);
     cudaEventRecord(stop2, 0);
@@ -480,22 +538,14 @@ int main(int argc, char* argv[]) {
     float time2;
     cudaEventElapsedTime(&time2, stop1, stop2);
 
-    // Stage 4
-    int *d_face_key, *d_face_value, *d_sphere_key, *d_sphere_value;
-    thrust::device_vector<int> t_face_key(face_key, face_key + BFaceSize);
-    thrust::device_vector<int> t_face_value(face_value, face_value + BFaceSize);
-    thrust::device_vector<int> t_sphere_key(sphere_key, sphere_key + BSphereSize);
-    thrust::device_vector<int> t_sphere_value(sphere_value, sphere_value + BSphereSize);
-    thrust::sort_by_key(t_face_key.begin(), t_face_key.end(), t_face_value.begin());
-    thrust::sort_by_key(t_sphere_key.begin(), t_sphere_key.end(), t_sphere_value.begin());
-    d_face_key = thrust::raw_pointer_cast(&t_face_key[0]);
-    d_face_value = thrust::raw_pointer_cast(&t_face_value[0]);
-    d_sphere_key = thrust::raw_pointer_cast(&t_sphere_key[0]);
-    d_sphere_value = thrust::raw_pointer_cast(&t_sphere_value[0]);
-    cudaMemcpy(face_key, d_face_key, sizeof(int) * BFaceSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(face_value, d_face_value, sizeof(int) * BFaceSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(sphere_key, d_sphere_key, sizeof(int) * BSphereSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(sphere_value, d_sphere_value, sizeof(int) * BSphereSize, cudaMemcpyDeviceToHost);
+    int *face_value = (int*)malloc(FaceMapSize * sizeof(int));
+    int *face_key = (int*)malloc(FaceMapSize * sizeof(int));
+    int *sphere_value = (int*)malloc(SphereMapSize * sizeof(int));
+    int *sphere_key = (int*)malloc(SphereMapSize * sizeof(int));
+    cudaMemcpy(face_key, d_face_key, sizeof(int) * FaceMapSize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(face_value, d_face_value, sizeof(int) * FaceMapSize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(sphere_key, d_sphere_key, sizeof(int) * SphereMapSize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(sphere_value, d_sphere_value, sizeof(int) * SphereMapSize, cudaMemcpyDeviceToHost);
 
     // Stage 5
     int bin_num = binnum[0] * binnum[1] * binnum[2];
@@ -506,14 +556,14 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < bin_num; i++) {
         C_face[i] = face_ptr;
         int isActive = 0;
-        while (face_ptr < BFaceSize && face_key[face_ptr] == i) {
+        while (face_ptr < FaceMapSize && face_key[face_ptr] == i) {
             face_ptr++;
             isActive = 1;
         }
         if (isActive == 0) C_face[i] = -1;
         C_sphere[i] = sphere_ptr;
         isActive = 0;
-        while (sphere_ptr < BSphereSize && sphere_key[sphere_ptr] == i) {
+        while (sphere_ptr < SphereMapSize && sphere_key[sphere_ptr] == i) {
             sphere_ptr++;
             isActive = 1;
         }
@@ -531,22 +581,15 @@ int main(int argc, char* argv[]) {
     // Temporarily skip stage 6
 
     // Stage 7
-    float *d_face;
-    Vector *d_sphere;
     int *d_C_face, *d_C_sphere;
-
     int *d_resultnum;
     int *d_collide_num;
 
-    cudaMalloc(&d_face, sizeof(float) * mesh.num_faces * STRIDE * 3);
-    cudaMalloc(&d_sphere, sizeof(Vector) * num_sphere);
     cudaMalloc(&d_C_sphere, sizeof(int) * bin_num);
     cudaMalloc(&d_C_face, sizeof(int) * bin_num);
     cudaMalloc(&d_collide_num, sizeof(int));
     cudaMalloc(&d_resultnum, sizeof(int) * bin_num);
 
-    cudaMemcpy(d_face, mesh.vtx, sizeof(float) * mesh.num_faces * STRIDE * 3, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sphere, sphere, sizeof(Vector) * num_sphere, cudaMemcpyHostToDevice);
     cudaMemcpy(d_C_sphere, C_sphere, sizeof(int) * bin_num, cudaMemcpyHostToDevice);
     cudaMemcpy(d_C_face, C_face, sizeof(int) * bin_num, cudaMemcpyHostToDevice);
     cudaMemset(d_collide_num, 0, sizeof(int));
@@ -554,26 +597,26 @@ int main(int argc, char* argv[]) {
 
     cuda_collide1<<<(bin_num+1023)/1024, 1024>>>(d_face, d_sphere, d_face_key, d_face_value,
                                                 d_sphere_key, d_sphere_value, d_C_face, d_C_sphere,
-                                                radius, bin_num, BFaceSize, BSphereSize,
+                                                radius, bin_num, FaceMapSize, SphereMapSize,
                                                 d_resultnum);
     cudaDeviceSynchronize();
 
-    int* resultnum = (int*)malloc(sizeof(int) * bin_num);
-    cudaMemcpy(resultnum, d_resultnum, sizeof(int) * bin_num, cudaMemcpyDeviceToHost);
-    int collide_num = thrust::reduce(resultnum, resultnum + bin_num);
+    thrust::device_ptr<int> t_resultnum(d_resultnum);
+    int collide_num = thrust::reduce(t_resultnum, t_resultnum + bin_num);
 
     CollidePair *d_result;
     cudaMalloc(&d_result, sizeof(CollidePair) * collide_num);
     cuda_collide2<<<(bin_num+1023)/1024, 1024>>>(d_face, d_sphere, d_face_key, d_face_value,
-            d_sphere_key, d_sphere_value, d_C_face, d_C_sphere,
-            radius, bin_num, BFaceSize, BSphereSize,
-            d_result, d_resultnum, d_collide_num);
+                                                d_sphere_key, d_sphere_value, d_C_face, d_C_sphere,
+                                                radius, bin_num, FaceMapSize, SphereMapSize,
+                                                d_result, d_resultnum, d_collide_num);
     cudaDeviceSynchronize();
 
-
+    thrust::device_ptr<CollidePair> t_result(d_result);
+    thrust::sort(t_result, t_result + collide_num, ResultCmp());
+    d_face_key = thrust::raw_pointer_cast(&t_face_key[0]);
     CollidePair *result = (CollidePair*)malloc(sizeof(CollidePair) * collide_num);
     cudaMemcpy(result, d_result, sizeof(CollidePair) * collide_num, cudaMemcpyDeviceToHost);
-    thrust::sort(result, result + collide_num, ResultCmp());
 
     cudaEventCreate(&stopEvent);
     cudaEventRecord(stopEvent, 0);
@@ -582,8 +625,8 @@ int main(int argc, char* argv[]) {
     cudaEventElapsedTime(&time4, stop3, stopEvent);
     cudaEventElapsedTime(&elapsedTime, stop1, stopEvent);
 
-    printf("Stage 1-3 time: %f ms\n", time2);
-    printf("Stage 4-5 time: %f ms\n", time3);
+    printf("Stage 1-4 time: %f ms\n", time2);
+    printf("Stage 5 time: %f ms\n", time3);
     printf("GPU collision detection time: %f ms\n", time4);
     printf("total time (w/out loading time): %f ms\n", elapsedTime);
 
@@ -600,18 +643,18 @@ int main(int argc, char* argv[]) {
         pair_num++;
     }
     fclose(fp);
-    //printf("1ST_PAIRS: %d\n", collide_num);
     printf("COLLIDE_PAIRS: %d\n", pair_num);
     printf("FINISH!\n");
 
     cudaFree(d_face);  cudaFree(d_sphere);
+    cudaFree(d_face_key); cudaFree(d_face_value);
+    cudaFree(d_sphere_key); cudaFree(d_sphere_value);
     cudaFree(d_C_face); cudaFree(d_C_sphere);
-    cudaFree(d_collide_num);
-    cudaFree(d_resultnum); cudaFree(d_result);
+    cudaFree(d_collide_num); cudaFree(d_resultnum); cudaFree(d_result);
 
     free(mesh.vtx); free(sphere);
     free(C_face); free(C_sphere);
-    free(resultnum); free(result);
+    free(result);
     return 0;
 }
 
