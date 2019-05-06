@@ -526,7 +526,7 @@ int main(int argc, char* argv[]) {
     int FaceMapSize, SphereMapSize;
     cudaMemcpy(&FaceMapSize, subdiv_face + mesh.num_faces - 1, sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&SphereMapSize, subdiv_sphere + num_sphere - 1, sizeof(int), cudaMemcpyDeviceToHost);
-    printf("%d, %d\n", FaceMapSize, SphereMapSize);
+    //printf("%d, %d\n", FaceMapSize, SphereMapSize);
 
     // Stage 3
     int *d_face_key, *d_face_value, *d_sphere_key, *d_sphere_value;

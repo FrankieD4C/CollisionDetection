@@ -8,4 +8,3 @@ set(CMAKE_C_FLAGS "-Wall -Wextra -O3 -lm")
 add_executable(collide collide.cu)
 add_executable(collide_bf collide_bf.c)
 
-
